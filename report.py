@@ -7,16 +7,14 @@ import requests
 from datetime import datetime, timezone, timedelta
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
+import feedparser
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-# ========= Stooq CSV 抓取 =========
-# 取最近 N 筆日資料（i=d）
-# 例如：^spx、^dji、^ndq、10yusy.b、xauusd、xagusd、cl.f、ux.f、dx.f
+# ----------------------------
+# Stooq: 取最後兩筆 Close
+# ----------------------------
 def stooq_last_two(symbol: str):
-    """
-    回傳 (last_close, prev_close, last_date)；抓不到就回 (None, None, None)
-    """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     try:
         r = requests.get(url, timeout=30)
@@ -33,8 +31,6 @@ def stooq_last_two(symbol: str):
     f = io.StringIO(text)
     reader = csv.DictReader(f)
     rows = list(reader)
-
-    # 有些會回很多年資料，取最後兩筆
     if len(rows) < 1:
         return None, None, None
 
@@ -73,129 +69,187 @@ def fchg(p):
     return f"（{sign}{p:.2f}%）"
 
 
-# ========= 抓市場快照 =========
+# ----------------------------
+# 抓市場快照（Stooq）
+# ----------------------------
 def get_snapshot():
-    # 指數（Stooq）
     spx, spx_prev, spx_date = stooq_last_two("^spx")
     dji, dji_prev, dji_date = stooq_last_two("^dji")
-    ndq, ndq_prev, ndq_date = stooq_last_two("^ndq")  # Nasdaq Composite in Stooq
+    ndq, ndq_prev, ndq_date = stooq_last_two("^ndq")
 
-    # 殖利率（Stooq）
     y10, y10_prev, _ = stooq_last_two("10yusy.b")
     y20, y20_prev, _ = stooq_last_two("20yusy.b")
     y30, y30_prev, _ = stooq_last_two("30yusy.b")
 
-    # 商品/匯率（Stooq）
-    gold, gold_prev, _ = stooq_last_two("xauusd")   # Gold spot (USD/oz)
-    silver, silver_prev, _ = stooq_last_two("xagusd")  # Silver spot (USD/oz)
-    wti, wti_prev, _ = stooq_last_two("cl.f")       # WTI (continuous futures on Stooq)
-    uranium, uranium_prev, _ = stooq_last_two("ux.f")  # Uranium (futures on Stooq)
-
-    # 美元指數：用 Stooq 的 DX.F（美元指數期貨連續）
+    gold, gold_prev, _ = stooq_last_two("xauusd")
+    silver, silver_prev, _ = stooq_last_two("xagusd")
+    wti, wti_prev, _ = stooq_last_two("cl.f")
+    uranium, uranium_prev, _ = stooq_last_two("ux.f")
     dxy, dxy_prev, _ = stooq_last_two("dx.f")
 
-    # 日期：用 SPX 的日期當主日期（美股）
     main_date = spx_date or dji_date or ndq_date
 
     return {
         "date": main_date,
-        "spx": spx,
-        "spx_chg": pct_change(spx, spx_prev),
-        "dji": dji,
-        "dji_chg": pct_change(dji, dji_prev),
-        "ndq": ndq,
-        "ndq_chg": pct_change(ndq, ndq_prev),
+        "spx": spx, "spx_chg": pct_change(spx, spx_prev),
+        "dji": dji, "dji_chg": pct_change(dji, dji_prev),
+        "ndq": ndq, "ndq_chg": pct_change(ndq, ndq_prev),
 
-        "y10": y10,
-        "y10_chg": pct_change(y10, y10_prev),
-        "y20": y20,
-        "y20_chg": pct_change(y20, y20_prev),
-        "y30": y30,
-        "y30_chg": pct_change(y30, y30_prev),
+        "y10": y10, "y10_chg": pct_change(y10, y10_prev),
+        "y20": y20, "y20_chg": pct_change(y20, y20_prev),
+        "y30": y30, "y30_chg": pct_change(y30, y30_prev),
 
-        "gold": gold,
-        "gold_chg": pct_change(gold, gold_prev),
-        "silver": silver,
-        "silver_chg": pct_change(silver, silver_prev),
-        "uranium": uranium,
-        "uranium_chg": pct_change(uranium, uranium_prev),
-        "wti": wti,
-        "wti_chg": pct_change(wti, wti_prev),
+        "gold": gold, "gold_chg": pct_change(gold, gold_prev),
+        "silver": silver, "silver_chg": pct_change(silver, silver_prev),
+        "uranium": uranium, "uranium_chg": pct_change(uranium, uranium_prev),
+        "wti": wti, "wti_chg": pct_change(wti, wti_prev),
 
-        "dxy": dxy,
-        "dxy_chg": pct_change(dxy, dxy_prev),
+        "dxy": dxy, "dxy_chg": pct_change(dxy, dxy_prev),
     }
 
 
-# ========= 產生日報（先用你要的版型 + B/C 混合口吻；新聞先留欄位，下一步再自動抓） =========
-def generate_report(s):
-    now = datetime.now(TZ_TAIPEI)
+# ----------------------------
+# Google News RSS 抓新聞
+# ----------------------------
+def get_news_titles():
+    queries = [
+        "Fed OR CPI OR PPI OR NFP",
+        "AI Nvidia AMD Broadcom",
+        "Middle East oil",
+        "S&P 500 Nasdaq",
+    ]
+    titles = []
+    for q in queries:
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:3]:
+            t = entry.title.strip()
+            if t and t not in titles:
+                titles.append(t)
+    return titles[:12]
 
-    # 如果 stooq 有回 date 用它，沒有就用今天
-    date_title = s["date"] if s.get("date") else now.strftime("%Y-%m-%d")
 
-    # 你要的標題格式
-    # 例：【2026年3月2日（週一）財經日報】
-    # 我用「今天台北」的週幾（你每天早上發）
-    title = f"【{now.strftime('%Y年%m月%d日')}（{['週一','週二','週三','週四','週五','週六','週日'][now.weekday()]}）財經日報】"
+# ----------------------------
+# 模型寫稿（OpenClaw / GPT）
+# ----------------------------
+def build_prompt(now, s, news_titles):
+    week = ["週一","週二","週三","週四","週五","週六","週日"][now.weekday()]
+    title = f"【{now.strftime('%Y年%m月%d日')}（{week}）財經日報】"
 
-    # 開頭（B+C 混合：快報節奏 + 理專可轉貼）
-    lead = (
-        "市場主軸：以風險情緒與利率走向為核心，資金在成長與防禦間快速輪動。"
-        "以下用「一頁式」幫你快速掌握昨日收盤與今天可轉貼的策略重點。"
-    )
+    news_block = "\n".join([f"• {t}" for t in news_titles]) if news_titles else "（今日無法取得新聞標題，請用市場數據生成摘要）"
 
-    text = f"""{title}
-{lead}
+    prompt = f"""
+你是銀行理專團隊的每日市場快報總編。
+請用「媒體快報節奏 + 理專可轉貼給客戶」的穩健語氣，輸出一則 LINE 財經日報。
+
+硬性規則：
+- 必須完全照版型輸出（段落與順序不可改）
+- 全文 <= 2200 字
+- 不能喊單、避免絕對語氣
+- 焦點新聞摘要請根據我提供的「新聞標題清單」整理，不要編造不存在的新聞細節
+
+{title}
+（開頭2~3句：交代市場主軸 + 情緒）
 
 一、 全球市場數據概覽
-1. 美股主要指數表現（收盤）
-• 道瓊工業指數 (DJI)：{fnum(s['dji'], 2)} {fchg(s['dji_chg'])}
-• 標普 500 指數 (S&P 500)：{fnum(s['spx'], 2)} {fchg(s['spx_chg'])}
-• 那斯達克綜合指數 (NDQ)：{fnum(s['ndq'], 2)} {fchg(s['ndq_chg'])}
-（註：費半 SOX 我下一步幫你補進來，先把主指數/利率/商品做準）
+1. 美股四大指數表現
+• 道瓊工業指數 (DJI)：{fnum(s['dji'],2)} {fchg(s['dji_chg'])}
+• 標普 500 指數 (S&P 500)：{fnum(s['spx'],2)} {fchg(s['spx_chg'])}
+• 那斯達克指數 (IXIC)：{fnum(s['ndq'],2)} {fchg(s['ndq_chg'])}
+（若你無法提供費半，就不要硬寫）
 
 2. 美國國債收益率 (Yield)
-• 10年期美債：{fnum(s['y10'], 3, '%')} {fchg(s['y10_chg'])}
-• 20年期美債：{fnum(s['y20'], 3, '%')} {fchg(s['y20_chg'])}
-• 30年期美債：{fnum(s['y30'], 3, '%')} {fchg(s['y30_chg'])}
+• 10年期美債：{fnum(s['y10'],3,'%')} {fchg(s['y10_chg'])}
+• 20年期美債：{fnum(s['y20'],3,'%')} {fchg(s['y20_chg'])}
+• 30年期美債：{fnum(s['y30'],3,'%')} {fchg(s['y30_chg'])}
 
-3. 匯市與原物料
-• 美元指數 (DXY 期貨連續)：{fnum(s['dxy'], 3)} {fchg(s['dxy_chg'])}
-• 黃金 (XAUUSD)：{fnum(s['gold'], 2)} {fchg(s['gold_chg'])}
-• 白銀 (XAGUSD)：{fnum(s['silver'], 4)} {fchg(s['silver_chg'])}
-• 鈾礦 (Uranium)：{fnum(s['uranium'], 2)} {fchg(s['uranium_chg'])}
-• 原油 (WTI)：{fnum(s['wti'], 2)} {fchg(s['wti_chg'])}
+3. 原物料商品表現
+• 黃金 (Spot Gold)：{fnum(s['gold'],2)}
+• 白銀 (Spot Silver)：{fnum(s['silver'],4)}
+• 鈾礦 (Uranium)：{fnum(s['uranium'],2)}
+• 原油 (WTI)：{fnum(s['wti'],2)}
 
-二、 焦點新聞摘要（先用「可手動貼」占位，下一步我再教你自動抓新聞）
-【總體經濟】
-• （貼 1 則：例 PPI / NFP / CPI / Fed 官員談話，用 1–2 句寫重點與影響）
-【市場主題】
-• （貼 1–2 則：例 AI、地緣政治、降息預期、油價）
-【焦點個股】
-• （貼 1–2 則：用理專可轉貼口吻，不要喊單）
+二、 焦點新聞摘要（請用下方標題整理成：總體/市場主題/焦點個股，各1~2則）
+新聞標題清單：
+{news_block}
 
 三、 股債匯操作策略建議（理專可直接轉貼）
-• 股市策略：短線避免追高，建議採「分批/分層」進場；若波動放大，以核心持倉 + 衛星題材的方式控風險。
-• 債市策略：利率波動期可用「短端息收 + 長端避險」的槓鈴概念，但部位不宜過滿，保留加碼空間。
-• 匯市與原物料策略：美元偏強時，商品容易震盪；黃金白銀偏避險屬性，但也可能短線急漲急跌，建議用小部位分批。
-
-風險提示：以上為市場資訊整理與一般性觀察，非任何投資建議；請依自身風險承受度與資產配置執行。
+• 股市策略：2~3句
+• 債市策略：2~3句
+• 匯市與原物料策略：2~3句
+最後加一句「今日一句話總結」。
 """
-    # LINE 單則不要太長，先把這版控制在可發範圍
-    return text.strip()
+    return prompt.strip()
 
 
-# ========= LINE 推播 =========
+def call_model(prompt: str):
+    endpoint = os.environ.get("MODEL_ENDPOINT")
+    api_key = os.environ.get("MODEL_API_KEY")
+
+    # 沒接模型：先回傳 None，走簡易版
+    if not endpoint:
+        return None
+
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    r = requests.post(endpoint, json={"prompt": prompt}, headers=headers, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("text")
+
+
+# ----------------------------
+# 沒接模型時的簡易版輸出（保底）
+# ----------------------------
+def fallback_report(now, s, news_titles):
+    week = ["週一","週二","週三","週四","週五","週六","週日"][now.weekday()]
+    title = f"【{now.strftime('%Y年%m月%d日')}（{week}）財經日報】"
+    news_show = "\n".join([f"• {t}" for t in news_titles[:6]]) if news_titles else "•（今日無法取得新聞標題）"
+
+    return f"""{title}
+市場主軸：風險情緒與利率預期主導，資金輪動加快。
+
+一、 全球市場數據概覽
+1. 美股主要指數
+• 道瓊 (DJI)：{fnum(s['dji'],2)} {fchg(s['dji_chg'])}
+• 標普 500：{fnum(s['spx'],2)} {fchg(s['spx_chg'])}
+• 那斯達克 (IXIC)：{fnum(s['ndq'],2)} {fchg(s['ndq_chg'])}
+
+2. 美國國債收益率
+• 10Y：{fnum(s['y10'],3,'%')}
+• 20Y：{fnum(s['y20'],3,'%')}
+• 30Y：{fnum(s['y30'],3,'%')}
+
+3. 商品
+• 黃金：{fnum(s['gold'],2)}
+• 白銀：{fnum(s['silver'],4)}
+• 鈾：{fnum(s['uranium'],2)}
+• WTI：{fnum(s['wti'],2)}
+
+二、 焦點新聞標題（保底列出）
+{news_show}
+
+三、 操作策略建議（保底）
+• 股市：分批與部位控管優先，避免追價。
+• 債市：以短端息收為主，保留加碼彈性。
+• 匯市與商品：波動可能放大，小部位分批。
+風險提示：以上為資訊整理，非投資建議。
+""".strip()
+
+
+# ----------------------------
+# LINE 推播
+# ----------------------------
 def push_line(text: str):
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     user_id = os.environ.get("LINE_USER_ID")
     if not token or not user_id:
-        raise ValueError("LINE 環境變數未設定：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID")
+        raise ValueError("缺少環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID")
 
     api = LineBotApi(token)
 
-    # 保守切 4800
     if len(text) <= 4800:
         api.push_message(user_id, TextSendMessage(text=text))
     else:
@@ -206,8 +260,14 @@ def push_line(text: str):
 
 
 def main():
+    now = datetime.now(TZ_TAIPEI)
     snap = get_snapshot()
-    report = generate_report(snap)
+    news_titles = get_news_titles()
+
+    prompt = build_prompt(now, snap, news_titles)
+    model_text = call_model(prompt)
+
+    report = model_text if model_text else fallback_report(now, snap, news_titles)
     push_line(report)
 
 
