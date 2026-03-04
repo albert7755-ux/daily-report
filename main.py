@@ -1,7 +1,8 @@
 import os
 import re
-from datetime import datetime, timezone, timedelta, date
-from typing import List, Dict, Any, Optional
+import json
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List
 
 from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookParser
@@ -11,16 +12,15 @@ from linebot.exceptions import InvalidSignatureError
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
+from report_tool import generate_report_today
+
 # ====== ENV ======
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Optional: 你可以改成你想用的模型
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
-
-# 最近幾則對話要帶進 LLM（省 token）
 RECENT_N = int(os.environ.get("RECENT_N", "12"))
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
@@ -32,21 +32,6 @@ parser = WebhookParser(LINE_CHANNEL_SECRET)
 client = OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-
-# ====== Your tools (自己寫的 functions) ======
-# 你可以把工具放到 tools/ 目錄，再在這裡 import
-# 例如 from report import generate_report
-
-def generate_report(style: str = "brief") -> str:
-    """
-    範例工具：你之後改成 import 你的 report.py 即可
-    """
-    now = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
-    if style == "brief":
-        return f"【財經日報（示範）】\n時間：{now}\n- 這裡接你 report.py 的輸出\n"
-    return f"【財經日報（示範/詳細）】\n時間：{now}\n- ...\n"
-
-
 # ====== DB init ======
 def init_db():
     with engine.begin() as conn:
@@ -54,7 +39,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS chat_messages (
             id BIGSERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
-            role TEXT NOT NULL,            -- 'user' | 'assistant'
+            role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -74,7 +59,6 @@ def init_db():
         """))
 
 init_db()
-
 
 # ====== DB helpers ======
 def save_msg(user_id: str, role: str, content: str):
@@ -96,18 +80,13 @@ def load_recent_messages(user_id: str, limit: int) -> List[Dict[str, str]]:
             """),
             {"u": user_id, "n": limit},
         ).fetchall()
-    # 倒序 → 正序
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 def get_today_summary(user_id: str) -> str:
     today = datetime.now(TZ_TAIPEI).date()
     with engine.begin() as conn:
         row = conn.execute(
-            text("""
-            SELECT summary
-            FROM daily_summary
-            WHERE user_id = :u AND ymd = :d
-            """),
+            text("SELECT summary FROM daily_summary WHERE user_id = :u AND ymd = :d"),
             {"u": user_id, "d": today},
         ).fetchone()
     return row[0] if row else ""
@@ -122,8 +101,7 @@ def upsert_today_summary(user_id: str, new_summary: str):
         DO UPDATE SET summary = EXCLUDED.summary, updated_at = NOW()
         """), {"u": user_id, "d": today, "s": new_summary})
 
-
-# ====== Command router (你要先跑的指令路由) ======
+# ====== Command router ======
 def is_command(s: str) -> bool:
     return s.strip().startswith("/")
 
@@ -136,7 +114,7 @@ def handle_command(user_text: str) -> str:
             "/help\n"
             "/calc 1+2*3\n"
             "/report\n"
-            "\n不是指令也可以直接聊天，我會用 AI 回答。"
+            "\n不是指令也可直接聊天，我會用 AI 回答。"
         )
 
     if t.startswith("/calc"):
@@ -152,27 +130,22 @@ def handle_command(user_text: str) -> str:
             return "算式計算失敗，請檢查格式。"
 
     if t == "/report":
-        # 這裡直接呼叫你的工具
-        return generate_report(style="brief")
+        # 指令直接出日報（不走 AI）
+        return generate_report_today(style="brief")
 
-    return "指令不明。輸入 /help 看可用指令。"
+    return "指令不明。輸入 /help 看可用指令，或直接用自然語言問我。"
 
-
-# ====== Tool calling schema (給 LLM 用) ======
+# ====== Tools for AI function calling ======
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_report",
-            "description": "產生今日財經日報（給LINE回覆用）",
+            "name": "generate_report_today",
+            "description": "產生今日財經日報（盤感早報版型）",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "style": {
-                        "type": "string",
-                        "enum": ["brief", "detailed"],
-                        "description": "日報長度風格"
-                    }
+                    "style": {"type": "string", "enum": ["brief", "detailed"]}
                 },
                 "required": []
             }
@@ -181,20 +154,20 @@ TOOLS = [
 ]
 
 def dispatch_tool_call(name: str, arguments: Dict[str, Any]) -> str:
-    if name == "generate_report":
+    if name == "generate_report_today":
         style = arguments.get("style", "brief")
-        return generate_report(style=style)
+        return generate_report_today(style=style)
     return f"工具不存在：{name}"
 
-
-# ====== AI chat with memory + tools ======
+# ====== AI with memory + tools ======
 def build_system_prompt(today_summary: str) -> str:
     return (
         "你是一個在 LINE 上提供協助的 AI 助理。\n"
-        "要求：回答要精準、可執行、少廢話。\n"
+        "要求：回答精準、可執行、少廢話。\n"
         "你可以使用工具（functions）來完成任務。\n"
+        "不要杜撰事實；不確定就給檢查清單。\n"
         "\n"
-        "【今日摘要（可用來理解今天脈絡）】\n"
+        "【今日摘要（用來承接今天脈絡）】\n"
         f"{today_summary if today_summary else '（今天目前沒有摘要）'}\n"
     )
 
@@ -206,7 +179,6 @@ def ai_chat(user_id: str, user_text: str) -> str:
     messages += recent
     messages += [{"role": "user", "content": user_text}]
 
-    # 1) 先讓模型決定要不要呼叫工具
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
@@ -217,49 +189,40 @@ def ai_chat(user_id: str, user_text: str) -> str:
 
     msg = resp.choices[0].message
 
-    # 2) 如果模型要呼叫工具：執行工具，再把結果回給模型整理成 final reply
+    # tool calling
     if getattr(msg, "tool_calls", None):
         tool_outputs = []
         for tc in msg.tool_calls:
             name = tc.function.name
-            args = {}
             try:
-                # OpenAI SDK 會給 JSON string
-                import json
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
 
-            tool_result = dispatch_tool_call(name, args)
-            tool_outputs.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
-            )
+            result = dispatch_tool_call(name, args)
+            tool_outputs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-        # 把 tool result 加入對話，再讓模型生成最終回覆
-        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls})
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": msg.tool_calls
+        })
         messages += tool_outputs
 
         resp2 = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=messages,
-            temperature=0.4,
+            temperature=0.35,
         )
-        final = resp2.choices[0].message.content.strip()
-        return final
+        return (resp2.choices[0].message.content or "").strip()
 
-    # 3) 不用工具：直接回覆
     return (msg.content or "").strip()
 
-
-# ====== Optional: update daily summary (省 token 的關鍵) ======
+# ====== Daily summary update (省 token) ======
 def update_daily_summary(user_id: str, user_text: str, assistant_text: str):
-    """
-    把今天的摘要維持在短短幾行，讓下一次對話少帶很多歷史訊息。
-    你也可以先不開這段，確認聊天穩定後再開。
-    """
     current = get_today_summary(user_id)
     prompt = (
-        "請把以下內容整合成『今天的短摘要』，限制 6-10 行，每行不超過 20 字。\n"
+        "請把以下內容整合成『今天的短摘要』，限制 6–10 行，每行不超過 20 字。\n"
         "摘要要保留：重要任務、重要結論、待辦。\n\n"
         f"【既有今日摘要】\n{current if current else '（無）'}\n\n"
         f"【新增對話】\n使用者：{user_text}\n助理：{assistant_text}\n"
@@ -268,16 +231,21 @@ def update_daily_summary(user_id: str, user_text: str, assistant_text: str):
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": "你是一個擅長做極短摘要的助理。"},
+            {"role": "system", "content": "你是擅長寫極短摘要的助理。"},
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
+        max_tokens=220,
     )
-    new_summary = resp.choices[0].message.content.strip()
+    new_summary = (resp.choices[0].message.content or "").strip()
     upsert_today_summary(user_id, new_summary)
 
+# ====== Health check (方便你看網站不是 detail not found) ======
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "eln-bot", "webhook": "/callback"}
 
-# ====== LINE webhook endpoint ======
+# ====== LINE webhook ======
 @app.post("/callback")
 async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature")
@@ -293,27 +261,27 @@ async def callback(request: Request):
             user_id = event.source.user_id
             user_text = event.message.text.strip()
 
-            # 1) 先寫入 DB（使用者訊息）
+            # 1) 寫入 DB（user）
             save_msg(user_id, "user", user_text)
 
             # 2) 先跑指令路由
             if is_command(user_text):
                 reply = handle_command(user_text)
             else:
-                # 3) 非指令 → AI（含：DB記憶 + 工具）
+                # 3) 非指令 → AI（含：記憶 + 工具）
                 reply = ai_chat(user_id, user_text)
 
-            # 4) 回覆 + 寫入 DB（助理回覆）
+            # 4) 寫入 DB（assistant）
             save_msg(user_id, "assistant", reply)
 
-            # 5) 更新今日摘要（可選；很推薦）
+            # 5) 更新今日摘要（只對非指令）
             if not is_command(user_text):
                 try:
                     update_daily_summary(user_id, user_text, reply)
                 except Exception:
-                    # 摘要失敗不影響回覆
                     pass
 
+            # 6) 回覆 LINE
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text=reply[:4900])
