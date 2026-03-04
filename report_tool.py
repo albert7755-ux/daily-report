@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 import os
 import re
 import requests
@@ -8,9 +7,6 @@ from openai import OpenAI
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-# -----------------------------
-# Helper functions
-# -----------------------------
 def to_float(v):
     try:
         if v is None:
@@ -22,24 +18,20 @@ def to_float(v):
     except Exception:
         return None
 
-
 def fnum(x, digits=2, suffix=""):
     if x is None:
         return "N/A"
     return f"{x:,.{digits}f}{suffix}"
-
 
 def abs_pct(p):
     if p is None:
         return "N/A"
     return f"{abs(p):.2f}%"
 
-
 def sign_word(p):
     if p is None:
         return "變動"
     return "上漲" if p >= 0 else "下跌"
-
 
 def market_tone(spx_chg):
     if spx_chg is None:
@@ -54,10 +46,6 @@ def market_tone(spx_chg):
         return "偏多續行"
     return "區間震盪"
 
-
-# -----------------------------
-# Yahoo Finance Quote API
-# -----------------------------
 def yahoo_quote(symbols):
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     params = {"symbols": ",".join(symbols)}
@@ -71,14 +59,12 @@ def yahoo_quote(symbols):
             out[sym] = item
     return out
 
-
 def yf_close(q):
     return to_float(q.get("regularMarketPreviousClose"))
 
-
 def yf_chg_pct(q):
+    # 你原本是直接吃 regularMarketChangePercent
     return to_float(q.get("regularMarketChangePercent"))
-
 
 def yf_yield_pct_from_yahoo_index(q):
     v = to_float(q.get("regularMarketPreviousClose"))
@@ -86,15 +72,11 @@ def yf_yield_pct_from_yahoo_index(q):
         v = to_float(q.get("regularMarketPrice"))
     return (v / 100.0) if v is not None else None
 
-
-# -----------------------------
-# Snapshot
-# -----------------------------
 def get_snapshot():
     syms = ["^DJI", "^GSPC", "^IXIC", "^TNX", "^TYX", "GC=F", "SI=F", "CL=F"]
     q = yahoo_quote(syms)
 
-    snap = {
+    return {
         "dji": yf_close(q.get("^DJI", {})),
         "dji_chg": yf_chg_pct(q.get("^DJI", {})),
 
@@ -116,12 +98,7 @@ def get_snapshot():
         "wti": yf_close(q.get("CL=F", {})),
         "wti_chg": yf_chg_pct(q.get("CL=F", {})),
     }
-    return snap
 
-
-# -----------------------------
-# Prompt
-# -----------------------------
 def build_prompt(now, s):
     week = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][now.weekday()]
     title = f"【{now.strftime('%Y年%m月%d日')}（{week}）財經日報】"
@@ -129,13 +106,13 @@ def build_prompt(now, s):
 
     prompt = f"""
 你是「品牌型每日財經日報」總編：文風像券商早報＋盤勢觀點，理專可直接轉貼客戶。
-寫法要有盤感、有畫面：用兩三句講清楚“昨晚為什麼這樣走、盤中轉折是什麼、收盤留下什麼結論”。
+寫法要有盤感、有畫面：用兩三句講清楚昨晚為什麼這樣走、盤中轉折是什麼、收盤留下什麼結論。
 
 硬規則（違反任一條就重寫）：
 1) 全文 750～1,050 字（含標點）
 2) 嚴禁使用 Markdown（不要 ###、不要 **粗體**、不要條列符號「-」「•」）
-3) 嚴禁任何稱呼/寒暄（不要「親愛的客戶」、不要問候語）
-4) 禁止出現「觀望」兩字（可用：保留彈性、分批、拉回、回測、逢低承接）
+3) 嚴禁任何稱呼/寒暄（不要問候語）
+4) 禁止出現「觀望」兩字
 5) 數字只能使用我提供的市場數據（指數、殖利率、金銀油），不得自行編數字
 6) 新聞/事件不要寫具體指名或細節；只能用「市場關注點」描述
 7) 版型必須完全照下方輸出，且「三、股債匯操作策略建議」一定要完整四行
@@ -165,7 +142,7 @@ def build_prompt(now, s):
 原油（WTI）： 報 ${fnum(s.get('wti'),2)}。（一句話：地緣/供需/風險溢價）
 
 二、 焦點新聞摘要
-【總體經濟】用 2–3 句：寫市場關注點如何影響利率與股市（不寫具體數字結果）。
+【總體經濟】用 2–3 句：寫市場正在盯的關鍵訊號以及它怎麼影響利率與股市（不寫具體數字結果）。
 【市場主題】用 2 句：寫地緣/油價/風險情緒/AI資金輪動等關注點，講清楚對盤面的直接影響。
 【焦點個股】用 2–3 句：用快報口吻寫 1–2 個主線代表題材，不喊單、不寫未證實消息。
 
@@ -177,14 +154,9 @@ def build_prompt(now, s):
 """
     return prompt.strip()
 
-
-# -----------------------------
-# OpenAI generation with strict validation + retry
-# -----------------------------
 def _ok(text: str) -> bool:
     if not text:
         return False
-
     must = [
         "一、 全球市場數據概覽",
         "二、 焦點新聞摘要",
@@ -196,7 +168,6 @@ def _ok(text: str) -> bool:
     ]
     if any(m not in text for m in must):
         return False
-
     if "觀望" in text:
         return False
     if "親愛的" in text or "您好" in text:
@@ -205,12 +176,9 @@ def _ok(text: str) -> bool:
         return False
     if "\n-" in text or "\n•" in text:
         return False
-
     if len(text) < 520 or len(text) > 2200:
         return False
-
     return True
-
 
 def generate_report_from_prompt(prompt: str) -> str:
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -235,20 +203,13 @@ def generate_report_from_prompt(prompt: str) -> str:
         text = (resp.choices[0].message.content or "").strip()
         text = re.sub(r"\n{3,}", "\n\n", text)
         last = text
-
         if _ok(text):
             return text
-
         prompt += "\n\n（提醒：上次輸出不合格。不得缺少策略段、不得出現“觀望”、不得使用markdown/條列/稱呼，且不可杜撰具體事件。）"
 
     return last
 
-
 def generate_report_today(style: str = "brief") -> str:
-    """
-    給 webhook / AI 工具呼叫用：直接回傳文字，不做 LINE push。
-    style 先保留，未來你可在 prompt 內分長短版本。
-    """
     now = datetime.now(TZ_TAIPEI)
     snap = get_snapshot()
     prompt = build_prompt(now, snap)
@@ -256,5 +217,4 @@ def generate_report_today(style: str = "brief") -> str:
 
     if not report or len(report) < 200:
         return f"【{now.strftime('%Y年%m月%d日')} 財經日報】\n系統提示：今日生成內容不足，請稍後重試。"
-
     return report
