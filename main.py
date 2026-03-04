@@ -1,288 +1,182 @@
+# -*- coding: utf-8 -*-
 import os
 import re
-import json
+import requests
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
-
-from fastapi import FastAPI, Request, HTTPException
-from linebot import LineBotApi, WebhookParser
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from linebot.exceptions import InvalidSignatureError
-
-from sqlalchemy import create_engine, text
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 from openai import OpenAI
-
-from report_tool import generate_report_today
-
-# ====== ENV ======
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
-RECENT_N = int(os.environ.get("RECENT_N", "12"))
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-# ====== Clients ======
-app = FastAPI()
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-parser = WebhookParser(LINE_CHANNEL_SECRET)
-client = OpenAI(api_key=OPENAI_API_KEY)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-# ====== DB init ======
-def init_db():
-    with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """))
-        conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS idx_chat_messages_user_time
-        ON chat_messages(user_id, created_at DESC);
-        """))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS daily_summary (
-            user_id TEXT NOT NULL,
-            ymd DATE NOT NULL,
-            summary TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (user_id, ymd)
-        );
-        """))
-
-init_db()
-
-# ====== DB helpers ======
-def save_msg(user_id: str, role: str, content: str):
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO chat_messages(user_id, role, content) VALUES (:u, :r, :c)"),
-            {"u": user_id, "r": role, "c": content},
-        )
-
-def load_recent_messages(user_id: str, limit: int) -> List[Dict[str, str]]:
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text("""
-            SELECT role, content
-            FROM chat_messages
-            WHERE user_id = :u
-            ORDER BY created_at DESC
-            LIMIT :n
-            """),
-            {"u": user_id, "n": limit},
-        ).fetchall()
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
-
-def get_today_summary(user_id: str) -> str:
-    today = datetime.now(TZ_TAIPEI).date()
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT summary FROM daily_summary WHERE user_id = :u AND ymd = :d"),
-            {"u": user_id, "d": today},
-        ).fetchone()
-    return row[0] if row else ""
-
-def upsert_today_summary(user_id: str, new_summary: str):
-    today = datetime.now(TZ_TAIPEI).date()
-    with engine.begin() as conn:
-        conn.execute(text("""
-        INSERT INTO daily_summary(user_id, ymd, summary, updated_at)
-        VALUES (:u, :d, :s, NOW())
-        ON CONFLICT (user_id, ymd)
-        DO UPDATE SET summary = EXCLUDED.summary, updated_at = NOW()
-        """), {"u": user_id, "d": today, "s": new_summary})
-
-# ====== Command router ======
-def is_command(s: str) -> bool:
-    return s.strip().startswith("/")
-
-def handle_command(user_text: str) -> str:
-    t = user_text.strip()
-
-    if t == "/help":
-    return "✅ [ELN-BOT NEW] 我是新的 webhook\n/help\n/calc 1+2\n/report\n/detail xxx"
-        )
-
-    if t.startswith("/calc"):
-        expr = t[len("/calc"):].strip()
-        if not expr:
-            return "用法：/calc 1+2*3"
-        if not re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s]+", expr):
-            return "算式格式不支援（只允許數字與 + - * / ( ) ）"
-        try:
-            result = eval(expr, {"__builtins__": {}})
-            return f"{expr} = {result}"
-        except Exception:
-            return "算式計算失敗，請檢查格式。"
-
-    if t == "/report":
-        # 指令直接出日報（不走 AI）
-        return generate_report_today(style="brief")
-
-    return "指令不明。輸入 /help 看可用指令，或直接用自然語言問我。"
-
-# ====== Tools for AI function calling ======
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_report_today",
-            "description": "產生今日財經日報（盤感早報版型）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "style": {"type": "string", "enum": ["brief", "detailed"]}
-                },
-                "required": []
-            }
-        }
-    }
-]
-
-def dispatch_tool_call(name: str, arguments: Dict[str, Any]) -> str:
-    if name == "generate_report_today":
-        style = arguments.get("style", "brief")
-        return generate_report_today(style=style)
-    return f"工具不存在：{name}"
-
-# ====== AI with memory + tools ======
-def build_system_prompt(today_summary: str) -> str:
-    return (
-        "你是一個在 LINE 上提供協助的 AI 助理。\n"
-        "要求：回答精準、可執行、少廢話。\n"
-        "你可以使用工具（functions）來完成任務。\n"
-        "不要杜撰事實；不確定就給檢查清單。\n"
-        "\n"
-        "【今日摘要（用來承接今天脈絡）】\n"
-        f"{today_summary if today_summary else '（今天目前沒有摘要）'}\n"
-    )
-
-def ai_chat(user_id: str, user_text: str) -> str:
-    today_summary = get_today_summary(user_id)
-    recent = load_recent_messages(user_id, limit=RECENT_N)
-
-    messages = [{"role": "system", "content": build_system_prompt(today_summary)}]
-    messages += recent
-    messages += [{"role": "user", "content": user_text}]
-
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.4,
-        tools=TOOLS,
-        tool_choice="auto",
-    )
-
-    msg = resp.choices[0].message
-
-    # tool calling
-    if getattr(msg, "tool_calls", None):
-        tool_outputs = []
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except Exception:
-                args = {}
-
-            result = dispatch_tool_call(name, args)
-            tool_outputs.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": msg.tool_calls
-        })
-        messages += tool_outputs
-
-        resp2 = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            temperature=0.35,
-        )
-        return (resp2.choices[0].message.content or "").strip()
-
-    return (msg.content or "").strip()
-
-# ====== Daily summary update (省 token) ======
-def update_daily_summary(user_id: str, user_text: str, assistant_text: str):
-    current = get_today_summary(user_id)
-    prompt = (
-        "請把以下內容整合成『今天的短摘要』，限制 6–10 行，每行不超過 20 字。\n"
-        "摘要要保留：重要任務、重要結論、待辦。\n\n"
-        f"【既有今日摘要】\n{current if current else '（無）'}\n\n"
-        f"【新增對話】\n使用者：{user_text}\n助理：{assistant_text}\n"
-    )
-
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": "你是擅長寫極短摘要的助理。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=220,
-    )
-    new_summary = (resp.choices[0].message.content or "").strip()
-    upsert_today_summary(user_id, new_summary)
-
-# ====== Health check (方便你看網站不是 detail not found) ======
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "eln-bot", "webhook": "/callback"}
-
-# ====== LINE webhook ======
-@app.post("/callback")
-async def callback(request: Request):
-    signature = request.headers.get("X-Line-Signature")
-    body = (await request.body()).decode("utf-8")
-
+# ---------- helpers ----------
+def to_float(v):
     try:
-        events = parser.parse(body, signature)
-    except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        if v is None: return None
+        v = str(v).strip()
+        if v == "" or v.lower() == "n/a": return None
+        return float(v)
+    except Exception:
+        return None
 
-    for event in events:
-        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
-            user_id = event.source.user_id
-            user_text = event.message.text.strip()
+def fnum(x, digits=2, suffix=""):
+    if x is None: return "N/A"
+    return f"{x:,.{digits}f}{suffix}"
 
-            # 1) 寫入 DB（user）
-            save_msg(user_id, "user", user_text)
+def abs_pct(p):
+    if p is None: return "N/A"
+    return f"{abs(p):.2f}%"
 
-            # 2) 先跑指令路由
-            if is_command(user_text):
-                reply = handle_command(user_text)
-            else:
-                # 3) 非指令 → AI（含：記憶 + 工具）
-                reply = ai_chat(user_id, user_text)
+def sign_word(p):
+    if p is None: return "變動"
+    return "上漲" if p >= 0 else "下跌"
 
-            # 4) 寫入 DB（assistant）
-            save_msg(user_id, "assistant", reply)
+def market_tone(spx_chg):
+    if spx_chg is None: return "震盪"
+    if spx_chg <= -1.2: return "回檔加深"
+    if spx_chg <= -0.3: return "回檔整理"
+    if spx_chg >= 1.2: return "強勢推進"
+    if spx_chg >= 0.3: return "偏多續行"
+    return "區間震盪"
 
-            # 5) 更新今日摘要（只對非指令）
-            if not is_command(user_text):
-                try:
-                    update_daily_summary(user_id, user_text, reply)
-                except Exception:
-                    pass
+# ---------- yahoo ----------
+def yahoo_quote(symbols):
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ",".join(symbols)}
+    r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    data = r.json()
+    out = {}
+    for item in data.get("quoteResponse", {}).get("result", []):
+        sym = item.get("symbol")
+        if sym:
+            out[sym] = item
+    return out
 
-            # 6) 回覆 LINE
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=reply[:4900])
-            )
+def yf_close(q):
+    return to_float(q.get("regularMarketPreviousClose"))
 
-    return "OK"
-@app.get("/whoami")
-def whoami():
-    return {"service": "eln-bot", "version": "NEW-2026-03-04-01"}
+def yf_chg_pct_consistent(q):
+    """
+    用 change/prevClose 自算，避免你之前遇到的「% 跟收盤不一致」。
+    """
+    prev = to_float(q.get("regularMarketPreviousClose"))
+    chg = to_float(q.get("regularMarketChange"))
+    if prev and chg is not None and prev != 0:
+        return (chg / prev) * 100.0
+    # fallback
+    return to_float(q.get("regularMarketChangePercent"))
+
+def yf_yield_pct_from_yahoo_index(q):
+    v = to_float(q.get("regularMarketPreviousClose"))
+    if v is None:
+        v = to_float(q.get("regularMarketPrice"))
+    return (v / 100.0) if v is not None else None
+
+def get_snapshot():
+    syms = ["^DJI", "^GSPC", "^IXIC", "^TNX", "^TYX", "GC=F", "SI=F", "CL=F"]
+    q = yahoo_quote(syms)
+
+    return {
+        "dji": yf_close(q.get("^DJI", {})),
+        "dji_chg": yf_chg_pct_consistent(q.get("^DJI", {})),
+
+        "spx": yf_close(q.get("^GSPC", {})),
+        "spx_chg": yf_chg_pct_consistent(q.get("^GSPC", {})),
+
+        "ndq": yf_close(q.get("^IXIC", {})),
+        "ndq_chg": yf_chg_pct_consistent(q.get("^IXIC", {})),
+
+        "y10": yf_yield_pct_from_yahoo_index(q.get("^TNX", {})),
+        "y30": yf_yield_pct_from_yahoo_index(q.get("^TYX", {})),
+
+        "gold": yf_close(q.get("GC=F", {})),
+        "gold_chg": yf_chg_pct_consistent(q.get("GC=F", {})),
+
+        "silver": yf_close(q.get("SI=F", {})),
+        "silver_chg": yf_chg_pct_consistent(q.get("SI=F", {})),
+
+        "wti": yf_close(q.get("CL=F", {})),
+        "wti_chg": yf_chg_pct_consistent(q.get("CL=F", {})),
+    }
+
+# ---------- prompt ----------
+def build_prompt(now, s):
+    week = ["週一","週二","週三","週四","週五","週六","週日"][now.weekday()]
+    title = f"【{now.strftime('%Y年%m月%d日')}（{week}）財經日報】"
+    tone = market_tone(s.get("spx_chg"))
+    # 你原本那段 prompt 直接貼回來即可（我省略不改你的風格）
+    # 這裡請保留你原本的完整內容
+    prompt = f"""{title}
+
+（開頭 2–3 句：昨晚盤勢屬於「{tone}」。...）
+...（你的完整版型與規則）...
+"""
+    return prompt.strip()
+
+def _ok(text: str) -> bool:
+    if not text: return False
+    must = ["一、 全球市場數據概覽","二、 焦點新聞摘要","三、 股債匯操作策略建議",
+            "股市策略：","債市策略：","匯市與原物料策略：","風險提示："]
+    if any(m not in text for m in must): return False
+    if "觀望" in text or "親愛的" in text or "您好" in text: return False
+    if "###" in text or "**" in text: return False
+    if "\n-" in text or "\n•" in text: return False
+    return 520 <= len(text) <= 2200
+
+def generate_report_from_prompt(prompt: str) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("缺少環境變數 OPENAI_API_KEY")
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    client = OpenAI(api_key=api_key)
+
+    last = ""
+    for _ in range(2):
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.25,
+            max_tokens=950,
+            messages=[
+                {"role":"system","content":"你是投資輔銷市場總編：必須照版型、短、有盤感、不可杜撰、不可使用“觀望”。"},
+                {"role":"user","content":prompt},
+                {"role":"user","content":"輸出後自我檢查：段落是否齊全、策略四行是否存在、是否未出現“觀望”、是否沒有markdown/條列/稱呼。不合格請立刻重寫並只輸出最終版。"},
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        last = text
+        if _ok(text):
+            return text
+        prompt += "\n\n（提醒：上次輸出不合格。不得缺少策略段、不得出現“觀望”、不得使用markdown/條列/稱呼，且不可杜撰具體事件。）"
+    return last
+
+# ===== 這個就是「工具模式」：給 webhook / AI 呼叫 =====
+def generate_report_today() -> str:
+    now = datetime.now(TZ_TAIPEI)
+    snap = get_snapshot()
+    prompt = build_prompt(now, snap)
+    report = generate_report_from_prompt(prompt)
+    if not report or len(report) < 200:
+        return f"【{now.strftime('%Y年%m月%d日')} 財經日報】\n系統提示：今日生成內容不足，請稍後重試。"
+    return report
+
+# ===== 這個保留你的「排程 push」模式 =====
+def push_line(text: str):
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    user_id = os.environ.get("LINE_USER_ID")
+    if not token or not user_id:
+        raise ValueError("缺少環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID")
+    api = LineBotApi(token)
+    if len(text) <= 4800:
+        api.push_message(user_id, TextSendMessage(text=text))
+    else:
+        api.push_message(user_id, [TextSendMessage(text=text[:4800]), TextSendMessage(text=text[4800:])])
+
+def main():
+    report = generate_report_today()
+    push_line(report)
+
+if __name__ == "__main__":
+    main()
