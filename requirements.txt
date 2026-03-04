@@ -1,4 +1,8 @@
-requests
+fastapi
+uvicorn
+sqlalchemy
+psycopg[binary]
+python-dotenv
 line-bot-sdk
-feedparser
 openai
+requests
