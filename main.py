@@ -283,3 +283,6 @@ async def callback(request: Request):
             )
 
     return "OK"
+@app.get("/whoami")
+def whoami():
+    return {"service": "eln-bot", "version": "NEW-2026-03-04-01"}
