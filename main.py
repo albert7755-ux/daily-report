@@ -109,12 +109,7 @@ def handle_command(user_text: str) -> str:
     t = user_text.strip()
 
     if t == "/help":
-        return (
-            "可用指令：\n"
-            "/help\n"
-            "/calc 1+2*3\n"
-            "/report\n"
-            "\n不是指令也可直接聊天，我會用 AI 回答。"
+    return "✅ [ELN-BOT NEW] 我是新的 webhook\n/help\n/calc 1+2\n/report\n/detail xxx"
         )
 
     if t.startswith("/calc"):
