@@ -1,351 +1,322 @@
-# -*- coding: utf-8 -*-
-
 import os
-import csv
-import io
 import re
-import requests
-from datetime import datetime, timezone, timedelta
-from linebot import LineBotApi
-from linebot.models import TextSendMessage
+from datetime import datetime, timezone, timedelta, date
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from linebot import LineBotApi, WebhookParser
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.exceptions import InvalidSignatureError
+
+from sqlalchemy import create_engine, text
 from openai import OpenAI
+
+# ====== ENV ======
+LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+# Optional: 你可以改成你想用的模型
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
+
+# 最近幾則對話要帶進 LLM（省 token）
+RECENT_N = int(os.environ.get("RECENT_N", "12"))
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-def pct_change(last, prev):
-    if last is None or prev is None or prev == 0:
-        return None
-    return (last - prev) / prev * 100.0
+# ====== Clients ======
+app = FastAPI()
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+parser = WebhookParser(LINE_CHANNEL_SECRET)
+client = OpenAI(api_key=OPENAI_API_KEY)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
-def fnum(x, digits=2, suffix=""):
-    if x is None:
-        return "N/A"
-    return f"{x:,.{digits}f}{suffix}"
+# ====== Your tools (自己寫的 functions) ======
+# 你可以把工具放到 tools/ 目錄，再在這裡 import
+# 例如 from report import generate_report
 
-
-def sign_word(p):
-    if p is None:
-        return "變動"
-    return "上漲" if p >= 0 else "下跌"
-
-
-def abs_pct(p):
-    if p is None:
-        return "N/A"
-    return f"{abs(p):.2f}%"
-
-
-def market_tone(spx_chg):
-    if spx_chg is None:
-        return "震盪"
-    if spx_chg <= -1.2:
-        return "回檔加深"
-    if spx_chg <= -0.3:
-        return "回檔整理"
-    if spx_chg >= 1.2:
-        return "強勢推進"
-    if spx_chg >= 0.3:
-        return "偏多續行"
-    return "區間震盪"
-
-
-def to_float(v):
-    try:
-        if v is None:
-            return None
-        v = str(v).strip()
-        if v == "" or v.lower() == "n/a":
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Stooq: daily series (robust)
-# -----------------------------
-def stooq_last_two(symbol: str):
+def generate_report(style: str = "brief") -> str:
     """
-    Return (last_close, prev_close, last_date).
-    Robust against blank rows.
+    範例工具：你之後改成 import 你的 report.py 即可
     """
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[stooq series fetch error] {symbol} err={e}")
-        return None, None, None
-
-    text = r.text.strip()
-    if not text or "Date" not in text:
-        print(f"[stooq series empty] {symbol}")
-        return None, None, None
-
-    f = io.StringIO(text)
-    reader = csv.DictReader(f)
-    rows = []
-    for row in reader:
-        c = to_float(row.get("Close"))
-        d = (row.get("Date") or "").strip()
-        if c is None or not d:
-            continue
-        rows.append((d, c))
-
-    if len(rows) == 0:
-        return None, None, None
-    if len(rows) == 1:
-        d, c = rows[-1]
-        return c, None, d
-
-    (d_last, c_last) = rows[-1]
-    (d_prev, c_prev) = rows[-2]
-    return c_last, c_prev, d_last
+    now = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+    if style == "brief":
+        return f"【財經日報（示範）】\n時間：{now}\n- 這裡接你 report.py 的輸出\n"
+    return f"【財經日報（示範/詳細）】\n時間：{now}\n- ...\n"
 
 
-# -----------------------------
-# Stooq: quote (fast)
-# -----------------------------
-def stooq_quote_last(symbol: str):
-    """
-    Quote endpoint: Symbol,Date,Time,Open,High,Low,Close,Volume
-    """
-    url = f"https://stooq.com/q/l/?s={symbol}"
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        parts = [p.strip() for p in r.text.strip().split(",")]
-        if len(parts) >= 7:
-            return to_float(parts[6])
-    except Exception as e:
-        print(f"[stooq quote error] {symbol} err={e}")
-    return None
+# ====== DB init ======
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,            -- 'user' | 'assistant'
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """))
+        conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_user_time
+        ON chat_messages(user_id, created_at DESC);
+        """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS daily_summary (
+            user_id TEXT NOT NULL,
+            ymd DATE NOT NULL,
+            summary TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, ymd)
+        );
+        """))
+
+init_db()
 
 
-# -----------------------------
-# WTI: quote -> daily fallback (stable)
-# -----------------------------
-def get_wti():
-    # Quote first (more current)
-    for sym in ["cl.f", "cl=F"]:
-        v = stooq_quote_last(sym)
-        if v is not None:
-            return v
+# ====== DB helpers ======
+def save_msg(user_id: str, role: str, content: str):
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO chat_messages(user_id, role, content) VALUES (:u, :r, :c)"),
+            {"u": user_id, "r": role, "c": content},
+        )
 
-    # Daily fallback (stable for morning report)
-    v, _, _ = stooq_last_two("cl.f")
-    if v is not None:
-        return v
-    v, _, _ = stooq_last_two("cl=F")
-    return v
+def load_recent_messages(user_id: str, limit: int) -> List[Dict[str, str]]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+            SELECT role, content
+            FROM chat_messages
+            WHERE user_id = :u
+            ORDER BY created_at DESC
+            LIMIT :n
+            """),
+            {"u": user_id, "n": limit},
+        ).fetchall()
+    # 倒序 → 正序
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+def get_today_summary(user_id: str) -> str:
+    today = datetime.now(TZ_TAIPEI).date()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+            SELECT summary
+            FROM daily_summary
+            WHERE user_id = :u AND ymd = :d
+            """),
+            {"u": user_id, "d": today},
+        ).fetchone()
+    return row[0] if row else ""
+
+def upsert_today_summary(user_id: str, new_summary: str):
+    today = datetime.now(TZ_TAIPEI).date()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO daily_summary(user_id, ymd, summary, updated_at)
+        VALUES (:u, :d, :s, NOW())
+        ON CONFLICT (user_id, ymd)
+        DO UPDATE SET summary = EXCLUDED.summary, updated_at = NOW()
+        """), {"u": user_id, "d": today, "s": new_summary})
 
 
-# -----------------------------
-# Snapshot
-# -----------------------------
-def get_snapshot():
-    dji, dji_prev, _ = stooq_last_two("^dji")
-    spx, spx_prev, _ = stooq_last_two("^spx")
-    ndq, ndq_prev, _ = stooq_last_two("^ndq")
+# ====== Command router (你要先跑的指令路由) ======
+def is_command(s: str) -> bool:
+    return s.strip().startswith("/")
 
-    y10, y10_prev, _ = stooq_last_two("10yusy.b")
-    y20, y20_prev, _ = stooq_last_two("20yusy.b")
-    y30, y30_prev, _ = stooq_last_two("30yusy.b")
+def handle_command(user_text: str) -> str:
+    t = user_text.strip()
 
-    gold, gold_prev, _ = stooq_last_two("xauusd")
-    silver, silver_prev, _ = stooq_last_two("xagusd")
+    if t == "/help":
+        return (
+            "可用指令：\n"
+            "/help\n"
+            "/calc 1+2*3\n"
+            "/report\n"
+            "\n不是指令也可以直接聊天，我會用 AI 回答。"
+        )
 
-    wti = get_wti()
+    if t.startswith("/calc"):
+        expr = t[len("/calc"):].strip()
+        if not expr:
+            return "用法：/calc 1+2*3"
+        if not re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s]+", expr):
+            return "算式格式不支援（只允許數字與 + - * / ( ) ）"
+        try:
+            result = eval(expr, {"__builtins__": {}})
+            return f"{expr} = {result}"
+        except Exception:
+            return "算式計算失敗，請檢查格式。"
 
-    return {
-        "dji": dji, "dji_chg": pct_change(dji, dji_prev),
-        "spx": spx, "spx_chg": pct_change(spx, spx_prev),
-        "ndq": ndq, "ndq_chg": pct_change(ndq, ndq_prev),
+    if t == "/report":
+        # 這裡直接呼叫你的工具
+        return generate_report(style="brief")
 
-        "y10": y10, "y10_chg": pct_change(y10, y10_prev),
-        "y20": y20, "y20_chg": pct_change(y20, y20_prev),
-        "y30": y30, "y30_chg": pct_change(y30, y30_prev),
+    return "指令不明。輸入 /help 看可用指令。"
 
-        "gold": gold, "gold_chg": pct_change(gold, gold_prev),
-        "silver": silver, "silver_chg": pct_change(silver, silver_prev),
 
-        "wti": wti,
+# ====== Tool calling schema (給 LLM 用) ======
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_report",
+            "description": "產生今日財經日報（給LINE回覆用）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "style": {
+                        "type": "string",
+                        "enum": ["brief", "detailed"],
+                        "description": "日報長度風格"
+                    }
+                },
+                "required": []
+            }
+        }
     }
+]
+
+def dispatch_tool_call(name: str, arguments: Dict[str, Any]) -> str:
+    if name == "generate_report":
+        style = arguments.get("style", "brief")
+        return generate_report(style=style)
+    return f"工具不存在：{name}"
 
 
-# -----------------------------
-# Prompt (your preferred "盤感早報" style)
-# - No emoji
-# - No markdown
-# - No greeting
-# - No "觀望"
-# - Must include strategy section
-# -----------------------------
-def build_prompt(now, s):
-    week = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][now.weekday()]
-    title = f"【{now.strftime('%Y年%m月%d日')}（{week}）財經日報】"
-    tone = market_tone(s.get("spx_chg"))
+# ====== AI chat with memory + tools ======
+def build_system_prompt(today_summary: str) -> str:
+    return (
+        "你是一個在 LINE 上提供協助的 AI 助理。\n"
+        "要求：回答要精準、可執行、少廢話。\n"
+        "你可以使用工具（functions）來完成任務。\n"
+        "\n"
+        "【今日摘要（可用來理解今天脈絡）】\n"
+        f"{today_summary if today_summary else '（今天目前沒有摘要）'}\n"
+    )
 
-    wti_line = f"${fnum(s.get('wti'),2)}" if s.get("wti") is not None else "數據暫缺"
+def ai_chat(user_id: str, user_text: str) -> str:
+    today_summary = get_today_summary(user_id)
+    recent = load_recent_messages(user_id, limit=RECENT_N)
 
-    prompt = f"""
-你是「品牌型每日財經日報」總編：文風像券商早報＋盤勢觀點，理專可直接轉貼客戶。
-寫法要有盤感、有畫面：用兩三句講清楚“昨晚為什麼這樣走、盤中轉折是什麼、收盤留下什麼結論”。
+    messages = [{"role": "system", "content": build_system_prompt(today_summary)}]
+    messages += recent
+    messages += [{"role": "user", "content": user_text}]
 
-硬規則（違反任一條就重寫）：
-1) 全文 750～1,050 字（含標點）
-2) 嚴禁使用 Markdown（不要 ###、不要 **粗體**、不要條列符號「-」「•」）
-3) 嚴禁任何稱呼/寒暄（不要「親愛的客戶」、不要問候語）
-4) 禁止出現「觀望」兩字（可用：保留彈性、分批、拉回、回測、逢低承接）
-5) 數字只能使用我提供的市場數據（指數、殖利率、金銀油），不得自行編數字
-6) 新聞/事件不要寫具體指名或細節；只能用「市場關注點」描述（例如：地緣風險升溫→油價風險溢價、數據週→利率預期擺盪）
-7) 版型必須完全照下方輸出，且「三、股債匯操作策略建議」一定要完整四行
+    # 1) 先讓模型決定要不要呼叫工具
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        temperature=0.4,
+        tools=TOOLS,
+        tool_choice="auto",
+    )
 
-請只輸出以下版型（不可多一行、不可少一段）：
+    msg = resp.choices[0].message
 
-{title}
+    # 2) 如果模型要呼叫工具：執行工具，再把結果回給模型整理成 final reply
+    if getattr(msg, "tool_calls", None):
+        tool_outputs = []
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = {}
+            try:
+                # OpenAI SDK 會給 JSON string
+                import json
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
 
-（開頭 2–3 句：昨晚盤勢屬於「{tone}」。一定要點到：利率/債市或地緣其一；語氣像快報）
+            tool_result = dispatch_tool_call(name, args)
+            tool_outputs.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+            )
 
-一、 全球市場數據概覽
-1. 美股三大指數表現
+        # 把 tool result 加入對話，再讓模型生成最終回覆
+        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls})
+        messages += tool_outputs
 
-道瓊工業指數： 收在 {fnum(s.get('dji'),2)} 點，{sign_word(s.get('dji_chg'))} {abs_pct(s.get('dji_chg'))}。（一句話：盤感原因）
-標普500指數： 收在 {fnum(s.get('spx'),2)} 點，{sign_word(s.get('spx_chg'))} {abs_pct(s.get('spx_chg'))}。（一句話：盤感原因）
-那斯達克指數： 收在 {fnum(s.get('ndq'),2)} 點，{sign_word(s.get('ndq_chg'))} {abs_pct(s.get('ndq_chg'))}。（一句話：盤感原因）
-
-2. 美國國債收益率
-
-10年期美債： 報 {fnum(s.get('y10'),3,'%')}。（一句話：利率走勢對股市情緒的解讀）
-20年期美債： 報 {fnum(s.get('y20'),3,'%')}。（一句話）
-30年期美債： 報 {fnum(s.get('y30'),3,'%')}。（一句話）
-
-3. 原物料商品表現
-
-黃金： 報 ${fnum(s.get('gold'),2)}。（一句話：避險/利率/美元邏輯）
-白銀： 報 ${fnum(s.get('silver'),4)}。（一句話：波動/資金/工業金融雙屬性）
-原油（WTI）： 報 {wti_line}。（一句話：地緣/供需/風險溢價）
-
-二、 焦點新聞摘要
-【總體經濟】用 2–3 句：寫“市場正在盯的關鍵數據/聯準會訊號”以及它怎麼影響利率與股市（不寫具體數字結果）。
-【市場主題】用 2 句：寫“地緣/油價/風險情緒/AI資金輪動”等關注點，講清楚對盤面的直接影響。
-【焦點個股】用 2–3 句：用快報口吻寫 1–2 個“主線代表題材”（AI/半導體/大型權值），不喊單、不寫未證實消息。
-
-三、 股債匯操作策略建議
-股市策略：3 句。主軸必須是“拉回分批、逢低承接主流龍頭與AI落地”，並加一句風險控管（分批/部位/回測）。
-債市策略：2 句。用白話講“息收/避險/長短搭配”的做法。
-匯市與原物料策略：2 句。提金銀/油的分批做法與波動提醒（避免用觀望）。
-風險提示：1 句（非投資建議）
-"""
-    return prompt.strip()
-
-
-# -----------------------------
-# OpenAI generation with strict validation + retry
-# -----------------------------
-def _ok(text: str) -> bool:
-    if not text:
-        return False
-
-    must = [
-        "一、 全球市場數據概覽",
-        "二、 焦點新聞摘要",
-        "三、 股債匯操作策略建議",
-        "股市策略：",
-        "債市策略：",
-        "匯市與原物料策略：",
-        "風險提示：",
-    ]
-    if any(m not in text for m in must):
-        return False
-
-    # Forbidden
-    if "觀望" in text:
-        return False
-    if "親愛的" in text or "您好" in text:
-        return False
-    if "###" in text or "**" in text:
-        return False
-    if "\n-" in text or "\n•" in text:
-        return False
-
-    # length sanity (LINE-safe & content-complete)
-    if len(text) < 520 or len(text) > 1800:
-        return False
-
-    return True
-
-
-def generate_report(prompt: str) -> str:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("缺少環境變數 OPENAI_API_KEY")
-
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=api_key)
-
-    last = ""
-    for _ in range(2):
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.25,
-            max_tokens=900,
-            messages=[
-                {"role": "system", "content": "你是投資輔銷市場總編：必須照版型、短、有盤感、不可杜撰、不可使用“觀望”。"},
-                {"role": "user", "content": prompt},
-                {"role": "user", "content": "輸出後自我檢查：段落是否齊全、策略三行是否存在、是否未出現“觀望”、是否沒有markdown/條列/稱呼。不合格請立刻重寫並只輸出最終版。"},
-            ],
+        resp2 = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.4,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        last = text
+        final = resp2.choices[0].message.content.strip()
+        return final
 
-        if _ok(text):
-            return text
-
-        prompt += "\n\n（提醒：上次輸出不合格。不得缺少策略段、不得出現“觀望”、不得使用markdown/條列/稱呼，且不可杜撰具體事件。）"
-
-    return last
+    # 3) 不用工具：直接回覆
+    return (msg.content or "").strip()
 
 
-# -----------------------------
-# LINE push
-# -----------------------------
-def push_line(text: str):
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    user_id = os.environ.get("LINE_USER_ID")
-    if not token or not user_id:
-        raise ValueError("缺少環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID")
+# ====== Optional: update daily summary (省 token 的關鍵) ======
+def update_daily_summary(user_id: str, user_text: str, assistant_text: str):
+    """
+    把今天的摘要維持在短短幾行，讓下一次對話少帶很多歷史訊息。
+    你也可以先不開這段，確認聊天穩定後再開。
+    """
+    current = get_today_summary(user_id)
+    prompt = (
+        "請把以下內容整合成『今天的短摘要』，限制 6-10 行，每行不超過 20 字。\n"
+        "摘要要保留：重要任務、重要結論、待辦。\n\n"
+        f"【既有今日摘要】\n{current if current else '（無）'}\n\n"
+        f"【新增對話】\n使用者：{user_text}\n助理：{assistant_text}\n"
+    )
 
-    api = LineBotApi(token)
-
-    # LINE length safe split
-    if len(text) <= 4800:
-        api.push_message(user_id, TextSendMessage(text=text))
-    else:
-        api.push_message(
-            user_id,
-            [TextSendMessage(text=text[:4800]), TextSendMessage(text=text[4800:])],
-        )
-
-
-def main():
-    now = datetime.now(TZ_TAIPEI)
-
-    snap = get_snapshot()
-    prompt = build_prompt(now, snap)
-    report = generate_report(prompt)
-
-    if not report or len(report) < 200:
-        report = f"【{now.strftime('%Y年%m月%d日')} 財經日報】\n系統提示：今日生成內容不足，請稍後重試。"
-
-    push_line(report)
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": "你是一個擅長做極短摘要的助理。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    new_summary = resp.choices[0].message.content.strip()
+    upsert_today_summary(user_id, new_summary)
 
 
-if __name__ == "__main__":
-    main()
+# ====== LINE webhook endpoint ======
+@app.post("/callback")
+async def callback(request: Request):
+    signature = request.headers.get("X-Line-Signature")
+    body = (await request.body()).decode("utf-8")
+
+    try:
+        events = parser.parse(body, signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    for event in events:
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
+            user_id = event.source.user_id
+            user_text = event.message.text.strip()
+
+            # 1) 先寫入 DB（使用者訊息）
+            save_msg(user_id, "user", user_text)
+
+            # 2) 先跑指令路由
+            if is_command(user_text):
+                reply = handle_command(user_text)
+            else:
+                # 3) 非指令 → AI（含：DB記憶 + 工具）
+                reply = ai_chat(user_id, user_text)
+
+            # 4) 回覆 + 寫入 DB（助理回覆）
+            save_msg(user_id, "assistant", reply)
+
+            # 5) 更新今日摘要（可選；很推薦）
+            if not is_command(user_text):
+                try:
+                    update_daily_summary(user_id, user_text, reply)
+                except Exception:
+                    # 摘要失敗不影響回覆
+                    pass
+
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=reply[:4900])
+            )
+
+    return "OK"
