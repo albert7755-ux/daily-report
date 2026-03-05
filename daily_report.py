@@ -183,8 +183,3 @@ if __name__ == "__main__":
 
 ---
 
-貼上之後記得去 Render 的 **Environment** 設這三個變數：
-```
-ANTHROPIC_API_KEY=
-LINE_CHANNEL_ACCESS_TOKEN=
-LINE_USER_ID=
